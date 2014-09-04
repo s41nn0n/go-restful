@@ -5,8 +5,6 @@ import (
 	// "github.com/emicklei/hopwatch"
 	"log"
 	"net/http"
-	"reflect"
-	"strings"
 )
 
 type SwaggerService struct {
@@ -55,18 +53,12 @@ func RegisterSwaggerService(config Config, wsContainer *restful.Container) {
 		rootPath := each.RootPath()
 		// skip the api service itself
 		if rootPath != config.ApiPath {
-			if rootPath == "" || rootPath == "/" {
-				// use routes
-				for _, route := range each.Routes() {
-					entry := staticPathFromRoute(route)
-					_, exists := sws.apiDeclarationMap[entry]
-					if !exists {
-						sws.apiDeclarationMap[entry] = sws.composeDeclaration(each, entry)
-					}
-				}
-			} else { // use root path
-				sws.apiDeclarationMap[each.RootPath()] = sws.composeDeclaration(each, each.RootPath())
+			b := SwaggerApiDeclarationBuilder{
+				Config:  config,
+				Service: each,
 			}
+			key, decl := b.ApiDeclaration()
+			sws.apiDeclarationMap[key] = decl
 		}
 	}
 
@@ -99,22 +91,6 @@ func RegisterSwaggerService(config Config, wsContainer *restful.Container) {
 	}
 }
 
-func staticPathFromRoute(r restful.Route) string {
-	static := r.Path
-	bracket := strings.Index(static, "{")
-	if bracket <= 1 { // result cannot be empty
-		return static
-	}
-	if bracket != -1 {
-		static = r.Path[:bracket]
-	}
-	if strings.HasSuffix(static, "/") {
-		return static[:len(static)-1]
-	} else {
-		return static
-	}
-}
-
 func enableCORS(req *restful.Request, resp *restful.Response, chain *restful.FilterChain) {
 	if origin := req.HeaderParameter(restful.HEADER_Origin); origin != "" {
 		// prevent duplicate header
@@ -139,99 +115,6 @@ func (sws SwaggerService) getListing(req *restful.Request, resp *restful.Respons
 
 func (sws SwaggerService) getDeclarations(req *restful.Request, resp *restful.Response) {
 	resp.WriteAsJson(sws.apiDeclarationMap[composeRootPath(req)])
-}
-
-func (sws SwaggerService) composeDeclaration(ws *restful.WebService, pathPrefix string) ApiDeclaration {
-	decl := ApiDeclaration{
-		SwaggerVersion: swaggerVersion,
-		BasePath:       sws.config.WebServicesUrl,
-		ResourcePath:   ws.RootPath(),
-		Models:         map[string]Model{}}
-
-	// collect any path parameters
-	rootParams := []Parameter{}
-	for _, param := range ws.PathParameters() {
-		rootParams = append(rootParams, asSwaggerParameter(param.Data()))
-	}
-	// aggregate by path
-	pathToRoutes := map[string][]restful.Route{}
-	for _, other := range ws.Routes() {
-		if strings.HasPrefix(other.Path, pathPrefix) {
-			routes := pathToRoutes[other.Path]
-			pathToRoutes[other.Path] = append(routes, other)
-		}
-	}
-	for path, routes := range pathToRoutes {
-		api := Api{Path: path, Description: ws.Documentation()}
-		for _, route := range routes {
-			operation := Operation{HttpMethod: route.Method,
-				Summary:  route.Doc,
-				Type:     asDataType(route.WriteSample),
-				Nickname: route.Operation}
-
-			operation.Consumes = route.Consumes
-			operation.Produces = route.Produces
-
-			// share root params if any
-			for _, swparam := range rootParams {
-				operation.Parameters = append(operation.Parameters, swparam)
-			}
-			// route specific params
-			for _, param := range route.ParameterDocs {
-				operation.Parameters = append(operation.Parameters, asSwaggerParameter(param.Data()))
-			}
-			sws.addModelsFromRouteTo(&operation, route, &decl)
-			api.Operations = append(api.Operations, operation)
-		}
-		decl.Apis = append(decl.Apis, api)
-	}
-	return decl
-}
-
-// addModelsFromRoute takes any read or write sample from the Route and creates a Swagger model from it.
-func (sws SwaggerService) addModelsFromRouteTo(operation *Operation, route restful.Route, decl *ApiDeclaration) {
-	if route.ReadSample != nil {
-		sws.addModelFromSampleTo(operation, false, route.ReadSample, decl.Models)
-	}
-	if route.WriteSample != nil {
-		sws.addModelFromSampleTo(operation, true, route.WriteSample, decl.Models)
-	}
-}
-
-// addModelFromSample creates and adds (or overwrites) a Model from a sample resource
-func (sws SwaggerService) addModelFromSampleTo(operation *Operation, isResponse bool, sample interface{}, models map[string]Model) {
-	st := reflect.TypeOf(sample)
-	isCollection := false
-	if st.Kind() == reflect.Slice || st.Kind() == reflect.Array {
-		st = st.Elem()
-		isCollection = true
-	} else {
-		if st.Kind() == reflect.Ptr {
-			if st.Elem().Kind() == reflect.Slice || st.Elem().Kind() == reflect.Array {
-				st = st.Elem().Elem()
-				isCollection = true
-			}
-		}
-	}
-	modelName := modelBuilder{}.keyFrom(st)
-	if isResponse {
-		if isCollection {
-			modelName = "array[" + modelName + "]"
-		}
-		operation.Type = modelName
-	}
-	modelBuilder{models}.addModel(reflect.TypeOf(sample), "")
-}
-
-func asSwaggerParameter(param restful.ParameterData) Parameter {
-	return Parameter{
-		Name:        param.Name,
-		Description: param.Description,
-		ParamType:   asParamType(param.Kind),
-		Type:        param.DataType,
-		DataType:    param.DataType,
-		Format:      asFormat(param.DataType),
-		Required:    param.Required}
 }
 
 // Between 1..7 path parameters is supported
@@ -267,31 +150,4 @@ func composeRootPath(req *restful.Request) string {
 		return path
 	}
 	return path + "/" + g
-}
-
-func asFormat(name string) string {
-	return "" // TODO
-}
-
-func asParamType(kind int) string {
-	switch {
-	case kind == restful.PathParameterKind:
-		return "path"
-	case kind == restful.QueryParameterKind:
-		return "query"
-	case kind == restful.BodyParameterKind:
-		return "body"
-	case kind == restful.HeaderParameterKind:
-		return "header"
-	case kind == restful.FormParameterKind:
-		return "form"
-	}
-	return ""
-}
-
-func asDataType(any interface{}) string {
-	if any == nil {
-		return "void"
-	}
-	return reflect.TypeOf(any).Name()
 }

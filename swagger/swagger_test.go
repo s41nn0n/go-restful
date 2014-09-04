@@ -24,8 +24,12 @@ func TestServiceToApi(t *testing.T) {
 		WebServicesUrl: "http://here.com",
 		ApiPath:        "/apipath",
 		WebServices:    []*restful.WebService{ws}}
-	sws := newSwaggerService(cfg)
-	decl := sws.composeDeclaration(ws, "/tests")
+
+	b := SwaggerApiDeclarationBuilder{
+		Config:  cfg,
+		Service: ws,
+	}
+	_, decl := b.ApiDeclaration()
 	_, err := json.MarshalIndent(decl, " ", " ")
 	if err != nil {
 		t.Fatal(err.Error())
@@ -48,9 +52,11 @@ type Item struct {
 }
 
 func TestIssue78(t *testing.T) {
-	sws := newSwaggerService(Config{})
+	b := SwaggerApiDeclarationBuilder{
+		Config: Config{},
+	}
 	models := map[string]Model{}
-	sws.addModelFromSampleTo(&Operation{}, true, Response{Items: &[]Item{}}, models)
+	b.addModelFromSampleTo(&Operation{}, true, Response{Items: &[]Item{}}, models)
 	model, ok := models["swagger.Response"]
 	if !ok {
 		t.Fatal("missing response model")
