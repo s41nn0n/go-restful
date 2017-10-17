@@ -5,9 +5,14 @@ package restful
 // that can be found in the LICENSE file.
 
 import (
-	"log"
+	"fmt"
+	"os"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync/atomic"
+
+	"github.com/emicklei/go-restful/log"
 )
 
 // RouteBuilder is a helper to construct Routes.
@@ -19,12 +24,19 @@ type RouteBuilder struct {
 	httpMethod  string        // required
 	function    RouteFunction // required
 	filters     []FilterFunction
+	conditions  []RouteSelectionConditionFunction
+
+	typeNameHandleFunc TypeNameHandleFunction // required
+
 	// documentation
 	doc                     string
+	notes                   string
 	operation               string
 	readSample, writeSample interface{}
 	parameters              []*Parameter
 	errorMap                map[int]ResponseError
+	metadata                map[string]interface{}
+	deprecated              bool
 }
 
 // Do evaluates each argument with the RouteBuilder itself.
@@ -79,11 +91,22 @@ func (b *RouteBuilder) Doc(documentation string) *RouteBuilder {
 	return b
 }
 
+// Notes is a verbose explanation of the operation behavior. Optional.
+func (b *RouteBuilder) Notes(notes string) *RouteBuilder {
+	b.notes = notes
+	return b
+}
+
 // Reads tells what resource type will be read from the request payload. Optional.
 // A parameter of type "body" is added ,required is set to true and the dataType is set to the qualified name of the sample's type.
 func (b *RouteBuilder) Reads(sample interface{}) *RouteBuilder {
+	fn := b.typeNameHandleFunc
+	if fn == nil {
+		fn = reflectTypeName
+	}
+	typeAsName := fn(sample)
+
 	b.readSample = sample
-	typeAsName := reflect.TypeOf(sample).String()
 	bodyParameter := &Parameter{&ParameterData{Name: "body"}}
 	bodyParameter.beBody()
 	bodyParameter.Required(true)
@@ -118,7 +141,8 @@ func (b *RouteBuilder) Param(parameter *Parameter) *RouteBuilder {
 	return b
 }
 
-// Operation allows you to document what the acutal method/function call is of the Route.
+// Operation allows you to document what the actual method/function call is of the Route.
+// Unless called, the operation name is derived from the RouteFunction set using To(..).
 func (b *RouteBuilder) Operation(name string) *RouteBuilder {
 	b.operation = name
 	return b
@@ -126,7 +150,7 @@ func (b *RouteBuilder) Operation(name string) *RouteBuilder {
 
 // ReturnsError is deprecated, use Returns instead.
 func (b *RouteBuilder) ReturnsError(code int, message string, model interface{}) *RouteBuilder {
-	log.Println("ReturnsError is deprecated, use Returns instead.")
+	log.Print("ReturnsError is deprecated, use Returns instead.")
 	return b.Returns(code, message, model)
 }
 
@@ -134,9 +158,10 @@ func (b *RouteBuilder) ReturnsError(code int, message string, model interface{})
 // The model parameter is optional ; either pass a struct instance or use nil if not applicable.
 func (b *RouteBuilder) Returns(code int, message string, model interface{}) *RouteBuilder {
 	err := ResponseError{
-		Code:    code,
-		Message: message,
-		Model:   model,
+		Code:      code,
+		Message:   message,
+		Model:     model,
+		IsDefault: false,
 	}
 	// lazy init because there is no NewRouteBuilder (yet)
 	if b.errorMap == nil {
@@ -146,10 +171,42 @@ func (b *RouteBuilder) Returns(code int, message string, model interface{}) *Rou
 	return b
 }
 
+// DefaultReturns is a special Returns call that sets the default of the response ; the code is zero.
+func (b *RouteBuilder) DefaultReturns(message string, model interface{}) *RouteBuilder {
+	b.Returns(0, message, model)
+	// Modify the ResponseError just added/updated
+	re := b.errorMap[0]
+	// errorMap is initialized
+	b.errorMap[0] = ResponseError{
+		Code:      re.Code,
+		Message:   re.Message,
+		Model:     re.Model,
+		IsDefault: true,
+	}
+	return b
+}
+
+// Metadata adds or updates a key=value pair to the metadata map.
+func (b *RouteBuilder) Metadata(key string, value interface{}) *RouteBuilder {
+	if b.metadata == nil {
+		b.metadata = map[string]interface{}{}
+	}
+	b.metadata[key] = value
+	return b
+}
+
+// Deprecate sets the value of deprecated to true.  Deprecated routes have a special UI treatment to warn against use
+func (b *RouteBuilder) Deprecate() *RouteBuilder {
+	b.deprecated = true
+	return b
+}
+
+// ResponseError represents a response; not necessarily an error.
 type ResponseError struct {
-	Code    int
-	Message string
-	Model   interface{}
+	Code      int
+	Message   string
+	Model     interface{}
+	IsDefault bool
 }
 
 func (b *RouteBuilder) servicePath(path string) *RouteBuilder {
@@ -160,6 +217,21 @@ func (b *RouteBuilder) servicePath(path string) *RouteBuilder {
 // Filter appends a FilterFunction to the end of filters for this Route to build.
 func (b *RouteBuilder) Filter(filter FilterFunction) *RouteBuilder {
 	b.filters = append(b.filters, filter)
+	return b
+}
+
+// If sets a condition function that controls matching the Route based on custom logic.
+// The condition function is provided the HTTP request and should return true if the route
+// should be considered.
+//
+// Efficiency note: the condition function is called before checking the method, produces, and
+// consumes criteria, so that the correct HTTP status code can be returned.
+//
+// Lifecycle note: no filter functions have been called prior to calling the condition function,
+// so the condition function should not depend on any context that might be set up by container
+// or route filters.
+func (b *RouteBuilder) If(condition RouteSelectionConditionFunction) *RouteBuilder {
+	b.conditions = append(b.conditions, condition)
 	return b
 }
 
@@ -175,14 +247,28 @@ func (b *RouteBuilder) copyDefaults(rootProduces, rootConsumes []string) {
 	}
 }
 
+// typeNameHandler sets the function that will convert types to strings in the parameter
+// and model definitions.
+func (b *RouteBuilder) typeNameHandler(handler TypeNameHandleFunction) *RouteBuilder {
+	b.typeNameHandleFunc = handler
+	return b
+}
+
 // Build creates a new Route using the specification details collected by the RouteBuilder
 func (b *RouteBuilder) Build() Route {
 	pathExpr, err := newPathExpression(b.currentPath)
 	if err != nil {
-		log.Fatalf("[restful] Invalid path:%s because:%v", b.currentPath, err)
+		log.Printf("[restful] Invalid path:%s because:%v", b.currentPath, err)
+		os.Exit(1)
 	}
 	if b.function == nil {
-		log.Fatalf("[restful] No function specified for route:" + b.currentPath)
+		log.Printf("[restful] No function specified for route:" + b.currentPath)
+		os.Exit(1)
+	}
+	operationName := b.operation
+	if len(operationName) == 0 && b.function != nil {
+		// extract from definition
+		operationName = nameOfFunction(b.function)
 	}
 	route := Route{
 		Method:         b.httpMethod,
@@ -191,18 +277,42 @@ func (b *RouteBuilder) Build() Route {
 		Consumes:       b.consumes,
 		Function:       b.function,
 		Filters:        b.filters,
+		If:             b.conditions,
 		relativePath:   b.currentPath,
 		pathExpr:       pathExpr,
 		Doc:            b.doc,
-		Operation:      b.operation,
+		Notes:          b.notes,
+		Operation:      operationName,
 		ParameterDocs:  b.parameters,
 		ResponseErrors: b.errorMap,
 		ReadSample:     b.readSample,
-		WriteSample:    b.writeSample}
+		WriteSample:    b.writeSample,
+		Metadata:       b.metadata,
+		Deprecated:     b.deprecated}
 	route.postBuild()
 	return route
 }
 
 func concatPath(path1, path2 string) string {
 	return strings.TrimRight(path1, "/") + "/" + strings.TrimLeft(path2, "/")
+}
+
+var anonymousFuncCount int32
+
+// nameOfFunction returns the short name of the function f for documentation.
+// It uses a runtime feature for debugging ; its value may change for later Go versions.
+func nameOfFunction(f interface{}) string {
+	fun := runtime.FuncForPC(reflect.ValueOf(f).Pointer())
+	tokenized := strings.Split(fun.Name(), ".")
+	last := tokenized[len(tokenized)-1]
+	last = strings.TrimSuffix(last, ")·fm") // < Go 1.5
+	last = strings.TrimSuffix(last, ")-fm") // Go 1.5
+	last = strings.TrimSuffix(last, "·fm")  // < Go 1.5
+	last = strings.TrimSuffix(last, "-fm")  // Go 1.5
+	if last == "func1" {                    // this could mean conflicts in API docs
+		val := atomic.AddInt32(&anonymousFuncCount, 1)
+		last = "func" + fmt.Sprintf("%d", val)
+		atomic.StoreInt32(&anonymousFuncCount, val)
+	}
+	return last
 }

@@ -5,6 +5,7 @@ package restful
 // that can be found in the LICENSE file.
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -19,11 +20,13 @@ import (
 type CrossOriginResourceSharing struct {
 	ExposeHeaders  []string // list of Header names
 	AllowedHeaders []string // list of Header names
-	AllowedDomains []string // list of allowed values for Http Origin. If empty all are allowed.
+	AllowedDomains []string // list of allowed values for Http Origin. An allowed value can be a regular expression to support subdomain matching. If empty all are allowed.
 	AllowedMethods []string
 	MaxAge         int // number of seconds before requiring new Options request
 	CookiesAllowed bool
 	Container      *Container
+
+	allowedOriginPatterns []*regexp.Regexp // internal field for origin regexp check.
 }
 
 // Filter is a filter function that implements the CORS flow as documented on http://enable-cors.org/server.html
@@ -32,26 +35,17 @@ func (c CrossOriginResourceSharing) Filter(req *Request, resp *Response, chain *
 	origin := req.Request.Header.Get(HEADER_Origin)
 	if len(origin) == 0 {
 		if trace {
-			traceLogger.Println("no Http header Origin set")
+			traceLogger.Print("no Http header Origin set")
 		}
 		chain.ProcessFilter(req, resp)
 		return
 	}
-	if len(c.AllowedDomains) > 0 { // if provided then origin must be included
-		included := false
-		for _, each := range c.AllowedDomains {
-			if each == origin {
-				included = true
-				break
-			}
+	if !c.isOriginAllowed(origin) { // check whether this origin is allowed
+		if trace {
+			traceLogger.Printf("HTTP Origin:%s is not part of %v, neither matches any part of %v", origin, c.AllowedDomains, c.allowedOriginPatterns)
 		}
-		if !included {
-			if trace {
-				traceLogger.Println("HTTP Origin:%s is not part of %v", origin, c.AllowedDomains)
-			}
-			chain.ProcessFilter(req, resp)
-			return
-		}
+		chain.ProcessFilter(req, resp)
+		return
 	}
 	if req.Request.Method != "OPTIONS" {
 		c.doActualRequest(req, resp)
@@ -62,6 +56,8 @@ func (c CrossOriginResourceSharing) Filter(req *Request, resp *Response, chain *
 		c.doPreflightRequest(req, resp)
 	} else {
 		c.doActualRequest(req, resp)
+		chain.ProcessFilter(req, resp)
+		return
 	}
 }
 
@@ -70,9 +66,13 @@ func (c CrossOriginResourceSharing) doActualRequest(req *Request, resp *Response
 	// continue processing the response
 }
 
-func (c CrossOriginResourceSharing) doPreflightRequest(req *Request, resp *Response) {
+func (c *CrossOriginResourceSharing) doPreflightRequest(req *Request, resp *Response) {
 	if len(c.AllowedMethods) == 0 {
-		c.AllowedMethods = c.Container.computeAllowedMethods(req)
+		if c.Container == nil {
+			c.AllowedMethods = DefaultContainer.computeAllowedMethods(req)
+		} else {
+			c.AllowedMethods = c.Container.computeAllowedMethods(req)
+		}
 	}
 
 	acrm := req.Request.Header.Get(HEADER_AccessControlRequestMethod)
@@ -122,13 +122,32 @@ func (c CrossOriginResourceSharing) isOriginAllowed(origin string) bool {
 	if len(c.AllowedDomains) == 0 {
 		return true
 	}
+
 	allowed := false
-	for _, each := range c.AllowedDomains {
-		if each == origin {
+	for _, domain := range c.AllowedDomains {
+		if domain == origin {
 			allowed = true
 			break
 		}
 	}
+
+	if !allowed {
+		if len(c.allowedOriginPatterns) == 0 {
+			// compile allowed domains to allowed origin patterns
+			allowedOriginRegexps, err := compileRegexps(c.AllowedDomains)
+			if err != nil {
+				return false
+			}
+			c.allowedOriginPatterns = allowedOriginRegexps
+		}
+
+		for _, pattern := range c.allowedOriginPatterns {
+			if allowed = pattern.MatchString(origin); allowed {
+				break
+			}
+		}
+	}
+
 	return allowed
 }
 
@@ -167,4 +186,17 @@ func (c CrossOriginResourceSharing) isValidAccessControlRequestHeader(header str
 		}
 	}
 	return false
+}
+
+// Take a list of strings and compile them into a list of regular expressions.
+func compileRegexps(regexpStrings []string) ([]*regexp.Regexp, error) {
+	regexps := []*regexp.Regexp{}
+	for _, regexpStr := range regexpStrings {
+		r, err := regexp.Compile(regexpStr)
+		if err != nil {
+			return regexps, err
+		}
+		regexps = append(regexps, r)
+	}
+	return regexps, nil
 }

@@ -1,5 +1,5 @@
 /*
-Package restful, a lean package for creating REST-style WebServices without magic.
+Package restful , a lean package for creating REST-style WebServices without magic.
 
 WebServices and Routes
 
@@ -145,29 +145,30 @@ Performance options
 
 This package has several options that affect the performance of your service. It is important to understand them and how you can change it.
 
-	restful.DefaultContainer.Router(CurlyRouter{})
-
-The default router is the RouterJSR311 which is an implementation of its spec (http://jsr311.java.net/nonav/releases/1.1/spec/spec.html).
-However, it uses regular expressions for all its routes which, depending on your usecase, may consume a significant amount of time.
-The CurlyRouter implementation is more lightweight that also allows you to use wildcards and expressions, but only if needed.
-
-	restful.DefaultContainer.DoNotRecover(true)
+	restful.DefaultContainer.DoNotRecover(false)
 
 DoNotRecover controls whether panics will be caught to return HTTP 500.
-If set to true, Route functions are responsible for handling any error situation.
-Default value is false; it will recover from panics. This has performance implications.
+If set to false, the container will recover from panics.
+Default value is true
 
-	restful.SetCacheReadEntity(false)
+	restful.SetCompressorProvider(NewBoundedCachedCompressors(20, 20))
 
-SetCacheReadEntity controls whether the response data ([]byte) is cached such that ReadEntity is repeatable.
-If you expect to read large amounts of payload data, and you do not use this feature, you should set it to false.
+If content encoding is enabled then the default strategy for getting new gzip/zlib writers and readers is to use a sync.Pool.
+Because writers are expensive structures, performance is even more improved when using a preloaded cache. You can also inject your own implementation.
 
 Trouble shooting
 
 This package has the means to produce detail logging of the complete Http request matching process and filter invocation.
-Enabling this feature requires you to set a log.Logger instance such as:
+Enabling this feature requires you to set an implementation of restful.StdLogger (e.g. log.Logger) instance such as:
 
 	restful.TraceLogger(log.New(os.Stdout, "[restful] ", log.LstdFlags|log.Lshortfile))
+
+Logging
+
+The restful.SetLogger() method allows you to override the logger used by the package. By default restful
+uses the standard library `log` package and logs to stdout. Different logging packages are supported as
+long as they conform to `StdLogger` interface defined in the `log` sub-package, writing an adapter for your
+preferred package is simple.
 
 Resources
 
@@ -179,6 +180,6 @@ Resources
 
 [showcases]: https://github.com/emicklei/mora, https://github.com/emicklei/landskape
 
-(c) 2012-2014, http://ernestmicklei.com. MIT License
+(c) 2012-2015, http://ernestmicklei.com. MIT License
 */
 package restful

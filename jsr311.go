@@ -41,9 +41,29 @@ func (r RouterJSR311) SelectRoute(
 
 // http://jsr311.java.net/nonav/releases/1.1/spec/spec3.html#x3-360003.7.2
 func (r RouterJSR311) detectRoute(routes []Route, httpRequest *http.Request) (*Route, error) {
+	ifOk := []Route{}
+	for _, each := range routes {
+		ok := true
+		for _, fn := range each.If {
+			if !fn(httpRequest) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			ifOk = append(ifOk, each)
+		}
+	}
+	if len(ifOk) == 0 {
+		if trace {
+			traceLogger.Printf("no Route found (from %d) that passes conditional checks", len(routes))
+		}
+		return nil, NewError(http.StatusNotFound, "404: Not Found")
+	}
+
 	// http method
 	methodOk := []Route{}
-	for _, each := range routes {
+	for _, each := range ifOk {
 		if httpRequest.Method == each.Method {
 			methodOk = append(methodOk, each)
 		}
@@ -55,26 +75,26 @@ func (r RouterJSR311) detectRoute(routes []Route, httpRequest *http.Request) (*R
 		return nil, NewError(http.StatusMethodNotAllowed, "405: Method Not Allowed")
 	}
 	inputMediaOk := methodOk
+
 	// content-type
 	contentType := httpRequest.Header.Get(HEADER_ContentType)
-	if httpRequest.ContentLength > 0 {
-		inputMediaOk = []Route{}
-		for _, each := range methodOk {
-			if each.matchesContentType(contentType) {
-				inputMediaOk = append(inputMediaOk, each)
-			}
-		}
-		if len(inputMediaOk) == 0 {
-			if trace {
-				traceLogger.Printf("no Route found (from %d) that matches HTTP Content-Type: %s\n", len(methodOk), contentType)
-			}
-			return nil, NewError(http.StatusUnsupportedMediaType, "415: Unsupported Media Type")
+	inputMediaOk = []Route{}
+	for _, each := range methodOk {
+		if each.matchesContentType(contentType) {
+			inputMediaOk = append(inputMediaOk, each)
 		}
 	}
+	if len(inputMediaOk) == 0 {
+		if trace {
+			traceLogger.Printf("no Route found (from %d) that matches HTTP Content-Type: %s\n", len(methodOk), contentType)
+		}
+		return nil, NewError(http.StatusUnsupportedMediaType, "415: Unsupported Media Type")
+	}
+
 	// accept
 	outputMediaOk := []Route{}
 	accept := httpRequest.Header.Get(HEADER_Accept)
-	if accept == "" {
+	if len(accept) == 0 {
 		accept = "*/*"
 	}
 	for _, each := range inputMediaOk {
@@ -88,7 +108,8 @@ func (r RouterJSR311) detectRoute(routes []Route, httpRequest *http.Request) (*R
 		}
 		return nil, NewError(http.StatusNotAcceptable, "406: Not Acceptable")
 	}
-	return r.bestMatchByMedia(outputMediaOk, contentType, accept), nil
+	// return r.bestMatchByMedia(outputMediaOk, contentType, accept), nil
+	return &outputMediaOk[0], nil
 }
 
 // http://jsr311.java.net/nonav/releases/1.1/spec/spec3.html#x3-360003.7.2

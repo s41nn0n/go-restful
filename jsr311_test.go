@@ -2,6 +2,7 @@ package restful
 
 import (
 	"io"
+	"net/http"
 	"sort"
 	"testing"
 )
@@ -65,6 +66,14 @@ func TestDetectDispatcher(t *testing.T) {
 //
 // Step 2 tests
 //
+
+// go test -v -test.run TestISSUE_179 ...restful
+func TestISSUE_179(t *testing.T) {
+	ws1 := new(WebService)
+	ws1.Route(ws1.GET("/v1/category/{param:*}").To(dummy))
+	routes := RouterJSR311{}.selectRoutes(ws1, "/v1/category/sub/sub")
+	t.Logf("%v", routes)
+}
 
 // go test -v -test.run TestISSUE_30 ...restful
 func TestISSUE_30(t *testing.T) {
@@ -181,38 +190,6 @@ func containsRoutePath(routes []Route, path string, t *testing.T) bool {
 	return false
 }
 
-var tempregexs = []struct {
-	template, regex        string
-	literalCount, varCount int
-}{
-	{"", "^(/.*)?$", 0, 0},
-	{"/a/{b}/c/", "^/a/([^/]+?)/c(/.*)?$", 2, 1},
-	{"/{a}/{b}/{c-d-e}/", "^/([^/]+?)/([^/]+?)/([^/]+?)(/.*)?$", 0, 3},
-	{"/{p}/abcde", "^/([^/]+?)/abcde(/.*)?$", 5, 1},
-}
-
-func TestTemplateToRegularExpression(t *testing.T) {
-	ok := true
-	for i, fixture := range tempregexs {
-		actual, lCount, vCount, _ := templateToRegularExpression(fixture.template)
-		if actual != fixture.regex {
-			t.Logf("regex mismatch, expected:%v , actual:%v, line:%v\n", fixture.regex, actual, i) // 11 = where the data starts
-			ok = false
-		}
-		if lCount != fixture.literalCount {
-			t.Logf("literal count mismatch, expected:%v , actual:%v, line:%v\n", fixture.literalCount, lCount, i)
-			ok = false
-		}
-		if vCount != fixture.varCount {
-			t.Logf("variable count mismatch, expected:%v , actual:%v, line:%v\n", fixture.varCount, vCount, i)
-			ok = false
-		}
-	}
-	if !ok {
-		t.Fatal("one or more expression did not match")
-	}
-}
-
 // go test -v -test.run TestSortableRouteCandidates ...restful
 func TestSortableRouteCandidates(t *testing.T) {
 	fixture := &sortableRouteCandidates{}
@@ -230,6 +207,44 @@ func TestSortableRouteCandidates(t *testing.T) {
 	last := fixture.candidates[len(fixture.candidates)-1]
 	if last.matchesCount != 0 && last.literalCount != 0 && last.nonDefaultCount != 0 {
 		t.Fatal("expected r1")
+	}
+}
+
+func TestDetectRouteReturns404IfNoRoutePassesConditions(t *testing.T) {
+	called := false
+	shouldNotBeCalledButWas := false
+
+	routes := []Route{
+		new(RouteBuilder).To(dummy).
+			If(func(req *http.Request) bool { return false }).
+			Build(),
+
+		// check that condition functions are called in order
+		new(RouteBuilder).
+			To(dummy).
+			If(func(req *http.Request) bool { return true }).
+			If(func(req *http.Request) bool { called = true; return false }).
+			Build(),
+
+		// check that condition functions short circuit
+		new(RouteBuilder).
+			To(dummy).
+			If(func(req *http.Request) bool { return false }).
+			If(func(req *http.Request) bool { shouldNotBeCalledButWas = true; return false }).
+			Build(),
+	}
+
+	_, err := RouterJSR311{}.detectRoute(routes, (*http.Request)(nil))
+	if se := err.(ServiceError); se.Code != 404 {
+		t.Fatalf("expected 404, got %d", se.Code)
+	}
+
+	if !called {
+		t.Fatal("expected condition function to get called, but it wasn't")
+	}
+
+	if shouldNotBeCalledButWas {
+		t.Fatal("expected condition function to not be called, but it was")
 	}
 }
 
